@@ -72,22 +72,41 @@ _DOMAIN_TO_SOSA: dict = {
     hc.Platform.CAMERA:              (True,  "Platform"),
     hc.Platform.ALARM_CONTROL_PANEL: (True,  "Platform"),
     # Skipped domains
-    hc.Platform.CALENDAR:        None,
-    hc.Platform.GEO_LOCATION:    None,
+    hc.Platform.CALENDAR:         None,
+    hc.Platform.GEO_LOCATION:     None,
     hc.Platform.IMAGE_PROCESSING: None,
-    hc.Platform.NOTIFY:          None,
-    hc.Platform.NUMBER:          None,
-    hc.Platform.SCENE:           None,
-    hc.Platform.SELECT:          None,
-    hc.Platform.STT:             None,
-    hc.Platform.TEXT:            None,
-    hc.Platform.TTS:             None,
-    hc.Platform.UPDATE:          None,
+    hc.Platform.NOTIFY:           None,
+    hc.Platform.NUMBER:           None,
+    hc.Platform.SCENE:            None,
+    hc.Platform.SELECT:           None,
+    hc.Platform.STT:              None,
+    hc.Platform.TEXT:             None,
+    hc.Platform.TTS:              None,
+    hc.Platform.UPDATE:           None,
 }
 
 _ACTUATOR_DOMAINS = {
     p for p, v in _DOMAIN_TO_SOSA.items()
     if v is not None and v[1] == "Actuator"
+}
+
+# ---------------------------------------------------------------------------
+# Bug #2 fix — per-domain toggle state overrides
+# ---------------------------------------------------------------------------
+# Maps domain string → tuple of default states to emit (replaces "on"/"off")
+# Empty tuple () means: no toggle states at all for this domain
+_TOGGLE_OVERRIDE: dict = {
+    "lock":    ("locked", "unlocked"),
+    "cover":   ("open",   "closed", "stop"),
+    "button":  (),   # button has no meaningful toggle states
+    "remote":  (),   # remote uses service calls, not toggle states
+}
+
+# Domains that get "on"/"off" by default (unless overridden above)
+_TOGGLE_DEFAULT = {
+    "switch", "light", "fan", "climate",
+    "siren", "vacuum", "humidifier", "media_player",
+    "water_heater",
 }
 
 
@@ -128,19 +147,29 @@ class HACVT_RDT(HACVT):
             name         = self.cs.getDeviceAttr(d, hc.ATTR_NAME)
             model        = self.cs.getDeviceAttr(d, hc.ATTR_MODEL)
 
-            # Device super-class (manufacturer + model)
-            d_super = MINE["device/" + mkname(manufacturer) + "_" + mkname(model)]
-            g.add((d_super, RDFS.subClassOf,  SOSA_NS["Platform"]))
-            g.add((d_g,     RDF.type,          d_super))
-            g.add((d_g,     RDFS.label,        Literal(name)))
+            # ----------------------------------------------------------
+            # Bug #1 fix — avoid mine:device/None_None superclass
+            # Only create a named sub-class when both manufacturer AND
+            # model are real values; otherwise type directly as Platform.
+            # ----------------------------------------------------------
+            mfr_valid = manufacturer and str(manufacturer) not in ("None", "")
+            mdl_valid = model        and str(model)        not in ("None", "")
+            if mfr_valid and mdl_valid:
+                d_super = MINE["device/" + mkname(manufacturer) + "_" + mkname(model)]
+                g.add((d_super, RDFS.subClassOf, SOSA_NS["Platform"]))
+                g.add((d_g,     RDF.type,         d_super))
+            else:
+                g.add((d_g, RDF.type, SOSA_NS["Platform"]))
+
+            g.add((d_g, RDFS.label, Literal(name)))
 
             # Area
             d_area    = self.cs.getYAMLText(f'area_id("{d}")')
             area_name = self.cs.getYAMLText(f'area_name("{d}")')
             if d_area.strip() not in ("None", ""):
                 area = pf.mkLocationURI(MINE, d_area.strip())
-                g.add((area,  RDF.type,           SOSA_NS["Platform"]))
-                g.add((area,  RDFS.label,          Literal(area_name.strip())))
+                g.add((area,  RDF.type,            SOSA_NS["Platform"]))
+                g.add((area,  RDFS.label,           Literal(area_name.strip())))
                 g.add((d_g,   SSN_NS["isHostedBy"], area))
 
             # Entities hosted by this device
@@ -234,20 +263,24 @@ class HACVT_RDT(HACVT):
         # Sensors: link to an ObservableProperty
         if sosa_class == "Sensor":
             prop_node = MINE["property/" + mkname(e_name)]
-            g.add((prop_node, RDF.type,            SOSA_NS["ObservableProperty"]))
-            g.add((e_node,    SOSA_NS["observes"],  prop_node))
+            g.add((prop_node, RDF.type,           SOSA_NS["ObservableProperty"]))
+            g.add((e_node,    SOSA_NS["observes"], prop_node))
 
-        # Actuators: link to a Procedure + harvest possible states
+        # Actuators: harvest possible states; only attach Procedure when useful
         elif sosa_class == "Actuator":
-            proc_node = MINE["procedure/" + mkname(e_name)]
-            g.add((proc_node, RDF.type,             SOSA_NS["Procedure"]))
-            g.add((e_node,    SOSA_NS["implements"], proc_node))
-            self._add_possible_states(g, MINE, e_node, entity_id, domain)
+            states_added = self._add_possible_states(g, MINE, e_node, entity_id, domain)
+            # Bug #3 fix — only create sosa:Procedure when the actuator
+            # actually has states to expose (button/remote have none).
+            if states_added > 0:
+                proc_node = MINE["procedure/" + mkname(e_name)]
+                g.add((proc_node, RDF.type,             SOSA_NS["Procedure"]))
+                g.add((e_node,    SOSA_NS["implements"], proc_node))
 
         return e_node
 
     # ------------------------------------------------------------------
     # Harvest possible actuator states from /api/services
+    # Returns the number of rdt:hasActuatorState triples added.
     # ------------------------------------------------------------------
     def _add_possible_states(
         self,
@@ -256,32 +289,41 @@ class HACVT_RDT(HACVT):
         e_node: URIRef,
         entity_id: str,
         domain,
-    ):
+    ) -> int:
         """
         Populate rdt:hasActuatorState triples from /api/services.
 
         Strategy:
-          1. For on/off-capable domains always add "on" / "off"
+          1. Emit domain-specific toggle states (via _TOGGLE_OVERRIDE /
+             _TOGGLE_DEFAULT) — Bug #2 fix: lock → locked/unlocked,
+             cover → open/closed/stop, button/remote → nothing.
           2. Inspect service fields:
              - selector.select  → explicit enum values
              - selector.number  → range annotation string range:min:max:stepN
              - selector.boolean → "true" / "false"
+
+        Returns the total count of triples added.
         """
+        count      = 0
         services   = self.cs.getServices()
         domain_key = str(domain)
 
-        toggle_domains = {
-            "switch", "light", "fan", "climate", "cover",
-            "lock", "siren", "vacuum", "humidifier", "media_player",
-        }
-        if domain_key in toggle_domains:
-            for state in ("on", "off"):
-                g.add((e_node, RDT_NS["hasActuatorState"], Literal(state)))
+        # --- Bug #2 fix: per-domain toggle states ---
+        if domain_key in _TOGGLE_OVERRIDE:
+            toggle_states = _TOGGLE_OVERRIDE[domain_key]
+        elif domain_key in _TOGGLE_DEFAULT:
+            toggle_states = ("on", "off")
+        else:
+            toggle_states = ()
+
+        for state in toggle_states:
+            g.add((e_node, RDT_NS["hasActuatorState"], Literal(state)))
+            count += 1
 
         if domain_key not in services:
-            return
+            return count
 
-        svc_map = services[domain_key]  # dict: service_name → service_info
+        svc_map = services[domain_key]
         for svc_name, svc_info in svc_map.items():
             if not isinstance(svc_info, dict):
                 continue
@@ -300,6 +342,7 @@ class HACVT_RDT(HACVT):
                         val = opt if isinstance(opt, str) else opt.get("value", "")
                         if val:
                             g.add((e_node, RDT_NS["hasActuatorState"], Literal(val)))
+                            count += 1
 
                 # Numeric range → encoded as range:min:max:stepN
                 if "number" in selector:
@@ -313,18 +356,24 @@ class HACVT_RDT(HACVT):
                             RDT_NS["hasActuatorState"],
                             Literal(f"range:{v_min}:{v_max}:step{step}", datatype=XSD.string),
                         ))
+                        count += 1
 
                 # Boolean field
                 if "boolean" in selector:
                     for bv in ("true", "false"):
                         g.add((e_node, RDT_NS["hasActuatorState"], Literal(bv)))
+                        count += 2
+
+        return count
 
     # ------------------------------------------------------------------
-    # Entities without a parent device (skip automations)
+    # Bug #4 fix — normalize getDeviceId() return value
+    # getDeviceId() may return Python None OR the string "None"
     # ------------------------------------------------------------------
     def _get_entities_wo_device(self):
         for k in self.cs.getStates():
-            if self.cs.getDeviceId(k["entity_id"]) == "None":
+            raw = self.cs.getDeviceId(k["entity_id"])
+            if not raw or str(raw).strip() in ("None", ""):
                 yield k
 
 
